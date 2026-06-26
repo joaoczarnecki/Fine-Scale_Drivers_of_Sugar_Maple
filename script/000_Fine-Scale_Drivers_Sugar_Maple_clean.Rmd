@@ -1,0 +1,1689 @@
+---
+title: "Fine-Scale Drivers of Sugar Maple (*Acer saccharum*) Habitat Suitability at its Northern Range Limit"
+author: "JoaoCzarnecki"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+    toc: yes
+    theme: united
+    fig_width: 10
+    fig_height: 10
+    keep_md: yes
+    df_print: tibble
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+.libPaths(c("H:/R_lib", .libPaths()))
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Overview
+
+This script implements a Species Distribution Modeling (SDM) approach using Random Forest to identify fine-scale environmental drivers of Sugar Maple (*Acer saccharum*) habitat patterns in the boreal-temperate ecotone of eastern Canada. The study focuses on the ecological unit UPE 1415NC, located in the transition zone between boreal and temperate forests.
+
+## Objectives
+
+1. Characterize topographic, climatic, and edaphic variables influencing Sugar Maple distribution
+2. Develop presence/absence models using Random Forest algorithm
+3. Evaluate model performance
+4. Identify key environmental predictors for Sugar Maple habitat suitability
+5. Project potential distribution habitat shifts under a future climate scenario
+
+## Methodology Overview
+
+The analysis follows these main steps:
+1. **Data Preparation**: Compile and process multi-source environmental data
+2. **Spatially Explicit Spatial distribution modeling**: Implement Random Forest with spatial blocking cross-validation
+3. **Suitability Drivers and Habitat Shift Analysis**: Identify key predictors and project future habitat suitability under SSP3 7.0 scenario
+
+## Study Area
+
+The study area encompasses approximately 12,644 km² in the UPE 1415NC ecological planning unit, characterized by mixed forests transitioning from boreal to temperate ecosystems. This region represents a critical zone for understanding climate change impacts on tree species distributions.
+
+# Data Sources and Preparation
+
+## Databases and R Packages
+
+```{r data, cache=TRUE, message=FALSE, warning=FALSE}
+library(sf)
+library(terra)
+library(tidyverse)
+library(readr)
+library(jsonlite)
+
+installed <- c(
+  "sf", "terra", "readr", "rpart", "CAST", "pROC", "arm", "iml", "RSAGA",
+  "sf", "sgsR", "ppcor", "sp", "spdep", "furrr", "dplyr", "tibble",
+  "randomForest", "randomForestExplainer"
+)
+lapply(installed, require, character.only = TRUE)
+if (!requireNamespace(installed, quietly = TRUE)) {
+  install.packages(installed)
+}
+install.packages(setdiff(installed, installed.packages()[, "Package"]))
+```
+
+## Study Area Definition
+
+```{r shape, cache=TRUE, message=FALSE, warning=FALSE}
+pol <- read_sf("database/study_area_ok.shp")
+
+st_area(pol)
+
+dtm <- rast("database/dtm/dtm_20_UPE.tif") %>%
+  mask(pol)
+plot(dtm, main = "Digital Terrain Model (DTM) - UPE 1415NC")
+
+plots <- read_csv("database/CMP_FOREL_UPE_1415NC/undisturbed_plots_sf_env_clim_4th_inv_study_area_PET.csv")
+plots <- plots %>%
+  mutate(
+    Presence = ifelse(ERS_n > 25, 1, 0),
+    Presence = as.factor(Presence)
+  )
+
+plots_sf <- st_as_sf(plots, coords = c("longitude", "latitude"), crs = 2950)
+
+mapview::mapview(plots_sf, zcol = "Presence") + mapview::mapview(pol)
+
+
+```
+
+### Study Area Map with Inset and Scientific Styling
+
+```{r studyareamap, cache=TRUE, message=FALSE, warning=FALSE}
+library(sf)
+library(ggplot2)
+library(ggspatial)
+library(cowplot)
+library(patchwork)
+library(rnaturalearth)
+
+study_area <- st_read("database/study_area_ok.shp") %>%
+  st_transform(crs = st_crs(2950))
+
+plots_inter <- plots_sf %>%
+  st_transform(crs = st_crs(2950)) %>%
+  mutate(Data_Partition = ifelse(row_number() %in% train_indices, "Training", "Test"))
+
+main_map <- ggplot() +
+  geom_sf(data = study_area, fill = "white", color = "black", linewidth = 0.4) +
+  geom_sf(data = plots_inter, aes(color = MAT, shape = Data_Partition), size = 1, alpha = 0.8) +
+  scale_color_viridis_c(name = "MAT (°C)", option = "mako", limits = c(0, 4)) +
+  annotation_scale(location = "br", width_hint = 0.3, style = "ticks") +
+  annotation_north_arrow(
+    location = "tl",
+    which_north = "true",
+    pad_x = unit(0.2, "in"),
+    pad_y = unit(0.3, "in"),
+    style = ggspatial::north_arrow_fancy_orienteering()
+  ) +
+  labs(
+    title = "Study Area and Plot Locations",
+    subtitle = "EPU 1415 NC, Quebec, Canada",
+    x = "Longitude (°)",
+    y = "Latitude (°)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, margin = ggplot2::margin(t = 0, r = 0, b = 10, l = 0)),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+world <- rnaturalearth::ne_countries(scale = "medium", returnclass = "sf")
+
+inset_map <- ggplot(world) +
+  geom_sf(fill = "lightgray", color = "white", linewidth = 0.3) +
+  geom_sf(
+    data = study_area %>% st_transform(crs = 4326),
+    fill = "red",
+    color = "darkred",
+    alpha = 0.7,
+    linewidth = 0.3
+  ) +
+  coord_sf(xlim = c(-100, -50), ylim = c(20, 60), expand = FALSE) +
+  labs(title = "Location in\n Eastern Canada") +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.4),
+    panel.grid.major = element_line(color = "gray95", linewidth = 0.2),
+    axis.text = element_blank(),
+    axis.title = element_blank(),
+    axis.ticks = element_blank()
+  )
+
+final_map <- main_map +
+  annotation_custom(
+    grob = ggplotGrob(inset_map),
+    xmin = st_bbox(study_area)["xmax"] - (st_bbox(study_area)["xmax"] - st_bbox(study_area)["xmin"]) * 0.3,
+    xmax = Inf,
+    ymin = st_bbox(study_area)["ymax"] - (st_bbox(study_area)["ymax"] - st_bbox(study_area)["ymin"]) * 0.3,
+    ymax = Inf
+  )
+
+print(final_map)
+
+ggsave(
+  filename = "results/Study_Area_Map_with_Inset.svg",
+  plot = final_map,
+  width = 10,
+  height = 8,
+  dpi = 96,
+  bg = "white"
+)
+
+main_map_framework <- ggplot() +
+  geom_sf(data = study_area, fill = "white", color = "black", linewidth = 0.4) +
+  geom_sf(data = plots_inter, aes(color = Data_Partition, shape = Data_Partition), size = 2, alpha = 0.8) +
+  scale_color_manual(values = c("Training" = "#004488", "Test" = "#EE3377")) +
+  annotation_scale(location = "br", width_hint = 0.3, style = "ticks") +
+  annotation_north_arrow(
+    location = "tl",
+    which_north = "true",
+    pad_x = unit(0.2, "in"),
+    pad_y = unit(0.3, "in"),
+    style = ggspatial::north_arrow_fancy_orienteering()
+  ) +
+  labs(
+    title = "Study Area and Plot Locations",
+    subtitle = "EPU 1415 NC, Quebec, Canada",
+    x = "Longitude (°)",
+    y = "Latitude (°)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, margin = ggplot2::margin(t = 0, r = 0, b = 10, l = 0)),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+dev.new(); print(main_map_framework)
+
+ggsave(
+  filename = "results/Study_Area_Map_Train_Test_Discriminated.svg",
+  plot = main_map_framework,
+  width = 10,
+  height = 8,
+  dpi = 96,
+  bg = "white"
+)
+
+main_map_presence <- ggplot() +
+  geom_sf(data = study_area, fill = "white", color = "black", linewidth = 0.4) +
+  geom_sf(data = plots_inter, aes(color = Presence), size = 1.5, alpha = 0.8, shape = 16) +
+  scale_color_manual(
+    values = c("0" = "#004488", "1" = "#EE3377"),
+    labels = c("0" = "Absent", "1" = "Present")
+  ) +
+  annotation_scale(location = "br", width_hint = 0.3, style = "ticks") +
+  annotation_north_arrow(
+    location = "tl",
+    which_north = "true",
+    pad_x = unit(0.2, "in"),
+    pad_y = unit(0.3, "in"),
+    style = ggspatial::north_arrow_fancy_orienteering()
+  ) +
+  labs(
+    title = "Study Area and Plot Locations",
+    subtitle = "EPU 1415 NC, Quebec, Canada - Sugar Maple Distribution",
+    x = "Longitude (°)",
+    y = "Latitude (°)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5, margin = ggplot2::margin(t = 0, r = 0, b = 10, l = 0)),
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    panel.grid.major = element_line(color = "gray90", linewidth = 0.3),
+    legend.position = "right",
+    legend.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(size = 9)
+  )
+
+dev.new(); print(main_map_presence)
+
+ggsave(
+  filename = "results/Study_Area_Map_Presence_Absence.svg",
+  plot = main_map_presence,
+  width = 10,
+  height = 8,
+  dpi = 96,
+  bg = "white"
+)
+```
+
+## Data Consolidation
+
+```{r consolidate, cache=TRUE, message=FALSE, warning=FALSE}
+library(terra)
+library(dplyr)
+
+presence <- rast("./database/CMP_FOREL_UPE_1415NC/CMP_FOREL_UPE_1415NC/DENDRO_FOREL_TIGES/TIGE_HA/TIGE_HA_ERS_U1415NC5OR.tif") %>%
+  project("EPSG:2950")
+presence[presence < 25]  <- 0
+presence[presence >= 25] <- 1
+
+presence_colors <- data.frame(
+  value = c(0, 1),
+  col_r = c(245, 34),
+  col_g = c(245, 139),
+  col_b = c(220, 34)
+)
+coltab(presence) <- presence_colors
+plot(presence, main = "Presence/Absence Data")
+
+sols         <- readRDS("./database/Sols/sols.rds")
+topo_df      <- readRDS("./database/topo_vars1/topo_vars.rds")
+contemp_clim <- read_csv("./database/UPE_1415NC/Climate/UPE_1415NC_Normal_1991_2020Y.csv")
+
+sols_topo <- sols %>% cbind(topo_df %>% dplyr::select(-Elevation))
+
+nrow(sols)
+nrow(topo_df)
+nrow(contemp_clim)
+
+base_env_clim <- cbind(contemp_clim, sols_topo)
+
+rm(contemp_clim, sols, topo_df); gc()
+
+base_env_clim_Normal <- base_env_clim %>%
+  mutate(
+    AspectClass = as.factor(AspectClass),
+    Curv_class  = as.factor(Curv_class)
+  )
+
+base_env_clim_Normal$Presence <- terra::extract(
+  presence, base_env_clim_Normal[, c("x", "y")], method = "simple"
+)[, 2]
+
+base_env_clim_Normal$Presence[base_env_clim_Normal$Presence < 25]  <- 0
+base_env_clim_Normal$Presence[base_env_clim_Normal$Presence >= 25] <- 1
+base_env_clim_Normal$Presence <- factor(
+  base_env_clim_Normal$Presence, levels = c(0, 1), labels = c("Absent", "Present")
+)
+
+library(readr)
+write_csv(base_env_clim_Normal, "./database/UPE_1415NC/base_env_clim_Normal.csv.gz")
+
+st_area(pol)
+```
+
+# Climate Scenarios Data Preparation — 1991–2020 to SSP3-7.0 2021–2040
+
+```{r climate_scenarios_part1, cache=TRUE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(data.table)
+
+selected_vars <- readRDS("./results/selected_vars_16feb26.rds")
+final_model   <- readRDS("./results/model_results_abio_pet_train_13feb26final.rds")
+sols          <- readRDS("./database/Sols/sols.rds")
+topo_df       <- readRDS("./database/topo_vars1/topo_vars.rds")
+
+sols_topo <- sols %>%
+  cbind(topo_df %>% dplyr::select(-Elevation)) %>%
+  mutate(
+    AspectClass = as.factor(AspectClass),
+    Curv_class  = as.factor(Curv_class)
+  ) %>%
+  rename(
+    Clay          = CLAY,
+    Silt          = SILT,
+    Sand          = SAND,
+    Organic_Matter = MO
+  )
+
+rm(sols, topo_df); gc()
+
+file_contemporary   <- "database/UPE_1415NC/Climate/UPE_1415NC_Normal_1991_2020Y.csv"
+file_future_2021_40 <- "database/UPE_1415NC/Climate/UPE_1415NC_4 GCMsY.csv"
+file_future_2041_60 <- "database/UPE_1415NC/Climate/UPE_1415NC_4 GCMsY_.csv"
+
+base_cols              <- c("x", "y")
+climate_vars_base_names <- c("MCMT", "MAP", "TD", "id1")
+ssp_identifiers        <- c("ssp126", "ssp245", "ssp370", "ssp585")
+
+# --- Contemporary (1991-2020) ---
+contemporary_data <- fread(
+  file_contemporary,
+  select     = c(base_cols, climate_vars_base_names),
+  na.strings = c("NA", "-9999", "")
+)
+contemporary_data[, Year := "Normal_1991_2020"]
+
+# --- Future 2021-2040 ---
+ssp_cols_2021_40 <- c("Year", "Latitude", "Longitude", climate_vars_base_names)
+filter_2021_40   <- "8GCMs_ensemble_ssp370_2021-2040.gcm"
+
+future_data_raw_2021_2040 <- fread(
+  file_future_2021_40,
+  select     = ssp_cols_2021_40,
+  na.strings = c("NA", "-9999", "")
+)[Year == filter_2021_40]
+
+# --- Future 2041-2060 ---
+ssp_cols_2041_60 <- c("Year", "Latitude", "Longitude", climate_vars_base_names)
+filter_2041_60   <- "8GCMs_ensemble_ssp370_2041-2060.gcm"
+
+future_data_raw_2041_2060 <- fread(
+  file_future_2041_60,
+  select     = ssp_cols_2041_60,
+  na.strings = c("NA", "-9999", "")
+)[Year == filter_2041_60]
+
+# Build combined datasets
+base_env_clim_Normal <- cbind(sols_topo, contemporary_data) %>%
+  dplyr::select(all_of(selected_vars), "x", "y", "Year") %>%
+  na.omit()
+
+base_env_clim_Normal$Presence <- terra::extract(
+  presence, base_env_clim_Normal[, c("x", "y")], method = "simple"
+)[, 2]
+
+plot(
+  rast(base_env_clim_Normal[, c("x", "y", "Presence")], type = "xyz", crs = "EPSG:2950"),
+  main = "Presence - Normal 1991-2020"
+)
+
+base_env_clim_ssp370_21 <- cbind(sols_topo[1:35347280, ], future_data_raw_2021_2040) %>%
+  dplyr::select(all_of(selected_vars), "x", "y", "Year") %>%
+  na.omit()
+
+base_env_clim_ssp370_41 <- cbind(sols_topo[1:35347280, ], future_data_raw_2041_2060) %>%
+  dplyr::select(all_of(selected_vars), "x", "y", "Year") %>%
+  na.omit()
+```
+
+# Modeling Approach
+
+Our approach involves using a Random Forest classification model to predict the presence or absence of sugar maple based on a suite of environmental predictors. We will implement spatial blocking and spatial cross-validation to account for spatial autocorrelation in our data, which is crucial for obtaining unbiased estimates of model performance. The model will be trained on the contemporary climate scenario (1991-2020) and then used to make predictions under future climate scenarios (SSP3-7.0 for 2021-2040). This will allow us to analyze potential habitat shifts for sugar maple under changing climate conditions.
+
+## Spatial Blocking and Spatial Cross-Validation
+
+This step involves creating spatial blocks to partition our data for cross-validation, which helps to mitigate the effects of spatial autocorrelation and provides a more realistic assessment of model performance. We will use the `blockCV` package to create spatial blocks and perform spatial cross-validation, ensuring that our training and testing datasets are spatially independent. This is essential for obtaining reliable estimates of model performance and for understanding the true predictive power of our model when applied to new, unseen locations.
+The cross-validation will be performed using a spatial blocking strategy, where the data is partitioned into spatially contiguous blocks. The CV will be done both for training and testing, ensuring that the model is evaluated on spatially independent data. This approach is crucial for species distribution modeling, as it accounts for spatial autocorrelation and provides a more realistic estimate of model performance when applied to new locations.
+
+```{r blockcv, cache=TRUE, message=FALSE, warning=FALSE}
+library(blockCV)
+
+final_vars <- c(
+  "TWI", "Insol_direct", "Wind_exposition",
+  "CEC", "MCMT", "MAP",
+  "x", "y", "Latitude", "Longitude"
+)
+
+pa_data <- plots_sf %>%
+  dplyr::select(any_of(final_vars))
+
+res_m    <- 100
+crs_epsg <- "EPSG:2950"
+
+vars_to_raster <- setdiff(final_vars, c("x", "y", "Latitude", "Longitude"))
+out_dir <- "./database/UPE_1415NC/raster"
+tmp_dir <- file.path(out_dir, "terra_tmp")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(tmp_dir, showWarnings = FALSE, recursive = TRUE)
+terraOptions(tempdir = tmp_dir, memfrac = 0.8)
+
+raster <- rast("database/UPE_1415NC/raster/env_clim_raster_100m.tif")
+plot(raster)
+
+df <- base_env_clim_Normal %>%
+  dplyr::rename(
+    Clay          = CLAY,
+    Silt          = SILT,
+    Sand          = SAND,
+    Organic_Matter = MO
+  ) %>%
+  dplyr::select(x, y, any_of(vars_to_raster))
+
+for (vname in vars_to_raster) {
+  if (!is.numeric(df[[vname]])) df[[vname]] <- as.numeric(df[[vname]])
+}
+
+v          <- terra::vect(df, geom = c("x", "y"), crs = crs_epsg, keepgeom = TRUE)
+e          <- terra::ext(v)
+r_template <- terra::rast(ext = e, res = res_m, crs = crs_epsg)
+
+rasters_list <- lapply(vars_to_raster, function(var) {
+  terra::rasterize(x = v, y = r_template, field = var, fun = "mean")
+})
+rasters       <- do.call(c, rasters_list)
+names(rasters) <- vars_to_raster
+
+terra::writeRaster(
+  rasters,
+  filename  = file.path(out_dir, paste0("env_clim_raster_", res_m, "m.tif")),
+  overwrite = TRUE
+)
+
+print(rasters)
+plot(rasters[[1]], main = names(rasters)[1])
+
+base_sf <- base_env_clim_Normal %>%
+  st_as_sf(coords = c("x", "y"), crs = 2950)
+
+pa_data <- base_sf %>%
+  dplyr::select(any_of(final_vars))
+
+v_data  <- terra::vect(pa_data)
+r       <- terra::rast(v_data, res = 100)
+terra::ext(r) <- terra::ext(v_data)
+env_vars_to_raster <- setdiff(final_vars, c("x", "y", "Latitude", "Longitude"))
+rasters <- terra::rasterize(v_data, r, field = env_vars_to_raster)
+
+set.seed(1304)
+sac1 <- cv_spatial_autocor(r = rasters, num_sample = 20000)
+
+saveRDS(sac1$range,       "./results/blockCV_results/sac1_range.rds")
+write.csv(sac1$range_table, "./results/blockCV_results/sac1_range_table.csv", row.names = FALSE)
+saveRDS(sac1$plots,       "./results/blockCV_results/sac1_plots.rds")
+saveRDS(sac1$num_sample,  "./results/blockCV_results/sac1_num_sample.rds")
+saveRDS(sac1$variograms,  "./results/blockCV_results/sac1_variograms.rds")
+
+set.seed(1304)
+sb1 <- cv_spatial(
+  x         = plots_sf,
+  k         = 5,
+  r         = raster,
+  size      = 8993,
+  selection = "random",
+  iteration = 100,
+  column    = "Presence",
+  seed      = 1304
+)
+
+sb1_export <- list(
+  folds_list = sb1$folds_list,
+  blocks     = sb1$blocks,
+  size       = sb1$size,
+  selection  = sb1$selection,
+  iteration  = sb1$iteration,
+  seed       = sb1$seed
+)
+saveRDS(sb1_export, "./results/blockCV_results/sb1_export.rds")
+```
+
+## Random Forest Classification
+
+In this step we model the presence/absence of sugar maple using a Random Forest classifier. We will use the `caret` package to train the model, incorporating the spatial blocks created in the previous step for cross-validation. The model will be trained on the contemporary climate scenario (1991-2020) and evaluated using metrics such as Kappa, AUC, and F1-score. Variable importance will also be assessed to identify key environmental predictors of sugar maple distribution. We also use findcor
+
+```{r rforest}
+library(caret)
+library(blockCV)
+library(doParallel)
+library(dplyr)
+library(sf)
+library(MLmetrics)
+sb1 <- readRDS("./results/blockCV_results/sb1_export.rds")
+train_indices <- sb1$folds_list[[1]][[1]]
+test_indices  <- sb1$folds_list[[1]][[2]]
+
+trainData <- plots_sf[train_indices, ] %>%
+  mutate(
+    Curv_class  = as.factor(Curv_class),
+    AspectClass = as.factor(AspectClass)
+  )
+
+testData <- plots_sf[test_indices, ] %>%
+  mutate(
+    Curv_class  = as.factor(Curv_class),
+    AspectClass = as.factor(AspectClass)
+  )
+
+cv_plot(sb1, x = plots_sf)
+
+vars_to_keep <- c(
+  "MCMT", "TWI", "Wind_exposition", "CEC", "TRI", "Organic_Matter",
+  "MAP", "RH", "pH", "TD", "Insol_diffuse", "Clay",
+  "Insol_direct", "TPI"
+)
+
+species_list <- c("ERS_n")
+pre_proc     <- c("nzv", "corr", "YeoJohnson", "center", "scale")
+
+pa_data <- sf::st_as_sf(trainData, coords = c("longitude", "latitude"), crs = 2950)
+
+# First run to determine variable importance and evaluate top predictors
+
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+model_results <- list()
+set.seed(1304)
+
+for (sp in species_list) {
+  message(paste("--- Training model for:", sp, "---"))
+
+  training_df <- pa_data %>%
+    st_drop_geometry() %>%
+    dplyr::select(any_of(vars_to_keep), !!sym(sp)) %>%
+    dplyr::rename(occ = !!sym(sp)) %>%
+    stats::na.omit() %>%
+    mutate(occ = factor(ifelse(occ > 0, "Pres", "Abs"), levels = c("Pres", "Abs")))
+
+  n_min <- min(table(training_df$occ))
+  if (n_min < 10) {
+    message(paste("Skipping", sp, "due to low presence count."))
+    next
+  }
+
+  sb <- cv_spatial(
+    x         = pa_data %>% filter(rownames(pa_data) %in% rownames(training_df)),
+    size      = 8993,
+    k         = 5,
+    selection = "random",
+    iteration = 100,
+    seed      = 1304,
+    progress  = FALSE
+  )
+
+  control <- trainControl(
+    method          = "cv",
+    index           = lapply(sb$folds_list, function(x) x[[1]]),
+    indexOut        = lapply(sb$folds_list, function(x) x[[2]]),
+    sampling        = "down",
+    classProbs      = TRUE,
+    savePredictions = "all",
+    summaryFunction = multiClassSummary,
+    allowParallel   = TRUE,
+    verboseIter     = TRUE
+  )
+
+  tune_grid <- expand.grid(mtry = c(2, 5, 10, 14))
+
+  model <- train(
+    occ ~ .,
+    data       = training_df,
+    method     = "rf",
+    metric     = "Kappa",
+    preProcess = pre_proc,
+    trControl  = control,
+    tuneGrid   = tune_grid,
+    ntree      = 1000,
+    importance = TRUE
+  )
+
+  model_results[[sp]] <- model
+}
+
+model <- model_results$ERS_n
+model$finalModel
+saveRDS(model_results, "results/model_results_abio_pet_train_13feb26final.rds")
+
+performance_summary <- imap_dfr(model_results, function(model, sp) {
+  best_result <- model$results[which.max(model$results$Kappa), ]
+  data.frame(Species = sp, best_result)
+})
+write.csv(performance_summary, "results/Model_Performance_Summary_13feb26final.csv", row.names = FALSE)
+
+importance_summary <- imap_dfr(model_results, function(model, sp) {
+  imp_matrix <- varImp(model, scale = FALSE)$importance
+  data.frame(
+    Species    = sp,
+    Variable   = rownames(imp_matrix),
+    Importance = imp_matrix$Pres
+  ) %>% dplyr::arrange(desc(Importance))
+})
+write.csv(importance_summary, "results/Variable_Importance_Summary_13feb26final.csv", row.names = FALSE)
+
+library(corrplot)
+trainData %>%
+  dplyr::select(all_of(vars_to_keep)) %>%
+  st_drop_geometry() %>%
+  cor(use = "pairwise.complete.obs") %>%
+  corrplot::corrplot(method = "color", type = "upper", tl.col = "black", tl.srt = 45)
+
+X_cor <- trainData %>%
+  st_drop_geometry() %>%
+  dplyr::select(all_of(vars_to_keep)) %>%
+  dplyr::select(where(is.numeric))
+X_cor <- X_cor[complete.cases(X_cor), , drop = FALSE]
+
+cor_mat       <- cor(X_cor, use = "pairwise.complete.obs", method = "pearson")
+vars_to_remove <- caret::findCorrelation(cor_mat, cutoff = 0.8, names = TRUE, exact = TRUE)
+vars_to_keep   <- setdiff(vars_to_keep, vars_to_remove)
+
+write.csv(importance_summary, "results/Variable_Importance_13feb26final.csv", row.names = FALSE)
+
+global_importance <- importance_summary %>%
+  group_by(Variable) %>%
+  summarise(Mean_Imp = mean(Importance), Max_Imp = max(Importance)) %>%
+  arrange(desc(Mean_Imp))
+write.csv(global_importance, "results/Global_Variable_Ranking_abio_pet_train_13feb26final.csv", row.names = FALSE)
+```
+
+## Forward Feature Selection and Final Random Forest Model
+
+In this step we will implement a forward feature selection (FFS) process using the `CAST` package to identify the most important predictors for the final Random Forest model. This approach will help us refine our variable set and potentially improve model performance by selecting only the most relevant features avoiding a priori bias.
+
+```{r FFS_RF, message=FALSE, warning=FALSE, cache=TRUE}
+library(caret)
+library(dplyr)
+library(CAST)
+library(randomForest)
+library(MLmetrics)
+library(doParallel)
+
+control <- trainControl(
+  method          = "cv",
+  index           = lapply(sb$folds_list, function(x) x[[1]]),
+  indexOut        = lapply(sb$folds_list, function(x) x[[2]]),
+  sampling        = "down",
+  classProbs      = TRUE,
+  savePredictions = "all",
+  summaryFunction = multiClassSummary,
+  allowParallel   = TRUE,
+  verboseIter     = TRUE
+)
+
+tuneGrid_rf <- expand.grid(.mtry = c(2, 5, 10))
+
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+clusterEvalQ(cl, {
+  library(MLmetrics)
+  library(caret)
+  library(randomForest)
+})
+
+set.seed(1304)
+ffs_model <- ffs(
+  predictors = training_df[, vars_to_keep],
+  response   = as.factor(training_df$occ),
+  method     = "rf",
+  trControl  = control,
+  tuneGrid   = tuneGrid_rf,
+  metric     = "Kappa",
+  ntree      = 1000
+)
+stopCluster(cl)
+
+print(ffs_model)
+plot(ffs_model)
+
+selected_vars <- ffs_model$selectedvars
+cat("Variables selected by FFS:\n")
+print(selected_vars)
+
+saveRDS(ffs_model,     "./results/ffs_model_16feb26.rds")
+saveRDS(selected_vars, "./results/selected_vars_16feb26.rds")
+```
+
+## Final Random Forest Model with FFS-Selected Variables
+
+Now that we have identified the most important predictors through forward feature selection, we will train a final Random Forest model using only these selected variables. This model will be evaluated using the same spatial cross-validation approach to ensure consistency in performance assessment.
+
+```{r finalCaretModel, message=FALSE, warning=FALSE, cache=TRUE}
+species_list <- c("ERS_n")
+pre_proc     <- c("nzv", "corr", "YeoJohnson", "center", "scale")
+
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+model_results <- list()
+set.seed(1304)
+
+for (sp in species_list) {
+  message(paste("--- Training model for:", sp, "---"))
+
+  training_df <- pa_data %>%
+    st_drop_geometry() %>%
+    dplyr::select(any_of(selected_vars), !!sym(sp)) %>%
+    dplyr::rename(occ = !!sym(sp)) %>%
+    stats::na.omit() %>%
+    mutate(occ = factor(ifelse(occ > 0, "Pres", "Abs"), levels = c("Pres", "Abs")))
+
+  n_min <- min(table(training_df$occ))
+  if (n_min < 10) {
+    message(paste("Skipping", sp, "due to low presence count."))
+    next
+  }
+
+  sb <- cv_spatial(
+    x         = pa_data %>% filter(rownames(pa_data) %in% rownames(training_df)),
+    size      = 8993,
+    k         = 5,
+    selection = "random",
+    iteration = 100,
+    seed      = 1304,
+    progress  = FALSE
+  )
+
+  control <- trainControl(
+    method          = "cv",
+    index           = lapply(sb$folds_list, function(x) x[[1]]),
+    indexOut        = lapply(sb$folds_list, function(x) x[[2]]),
+    sampling        = "down",
+    classProbs      = TRUE,
+    savePredictions = "all",
+    summaryFunction = multiClassSummary,
+    allowParallel   = TRUE,
+    verboseIter     = TRUE
+  )
+
+  tune_grid <- expand.grid(mtry = c(2, 5, 10))
+
+  model <- caret::train(
+    occ ~ .,
+    data       = training_df,
+    method     = "rf",
+    metric     = "Kappa",
+    preProcess = pre_proc,
+    trControl  = control,
+    tuneGrid   = tune_grid,
+    ntree      = 1000,
+    importance = TRUE
+  )
+
+  model_results[[sp]] <- model
+}
+
+model <- model_results$ERS_n
+saveRDS(model_results, "results/model_results_abio_pet_train_13feb26final_afterFFS.rds")
+model <- readRDS("results/model_results_abio_pet_train_13feb26final_afterFFS.rds")$ERS_n
+
+performance_summary <- imap_dfr(model_results, function(model, sp) {
+  best_result <- model$results[which.max(model$results$Kappa), ]
+  data.frame(Species = sp, best_result)
+})
+write.csv(performance_summary, "results/Model_Performance_Summary_13feb26final_afterFFS.csv", row.names = FALSE)
+
+importance_summary <- imap_dfr(model_results, function(model, sp) {
+  imp_matrix <- varImp(model, scale = FALSE)$importance
+  data.frame(
+    Species    = sp,
+    Variable   = rownames(imp_matrix),
+    Importance = imp_matrix$Pres
+  ) %>% dplyr::arrange(desc(Importance))
+})
+write.csv(importance_summary, "results/Variable_Importance_Summary_13feb26final_afterFFS.csv", row.names = FALSE)
+
+
+global_importance <- importance_summary %>%
+  group_by(Variable) %>%
+  summarise(Mean_Imp = mean(Importance), Max_Imp = max(Importance)) %>%
+  arrange(desc(Mean_Imp))
+write.csv(global_importance, "results/Global_Variable_Ranking_abio_pet_train_13feb26final_afterFFS.csv", row.names = FALSE)
+
+# Plot Correlation Matrix after FFS to visualize relationships among selected predictors
+
+svg("Correlation_Matrix.svg", width = 12, height = 12)
+cor_mat_plot <- trainData %>%
+  dplyr::select(all_of(selected_vars)) %>%
+  st_drop_geometry() %>%
+  as.matrix()
+p_mat      <- cor.mtest(cor_mat_plot, conf.level = 0.95)$p
+cor_matrix <- cor(cor_mat_plot, use = "pairwise.complete.obs")
+corrplot::corrplot(
+  cor_matrix,
+  method        = "color",
+  type          = "upper",
+  tl.col        = "black",
+  tl.srt        = 45,
+  mar           = c(0, 0, 1, 0),
+  diag          = TRUE,
+  title         = "Predictor Correlation Matrix",
+  addCoef.col   = "black",
+  number.digits = 2,
+  number.cex    = 0.7,
+  number.font   = 1,
+  p.mat         = p_mat,
+  sig.level     = c(0.001, 0.01, 0.05),
+  insig         = "label_sig",
+  pch.cex       = 0.9,
+  pch.col       = "black"
+)
+dev.off()
+
+
+```
+
+## Independent Test Set Evaluation
+
+Here we will evaluate the performance of our final Random Forest model on an independent test set that was not used during model training or feature selection. This evaluation will provide an unbiased estimate of the model's predictive performance on unseen data.
+
+```{r independent_test_set_plot, message=FALSE, warning=FALSE, cache=TRUE}
+library(stringr)
+library(pROC)
+
+testData <- testData %>%
+  mutate(occ = factor(ifelse(ERS_n > 25, "Pres", "Abs"), levels = c("Pres", "Abs"))) %>%
+  tidyr::drop_na(occ, all_of(model$finalModel$xNames))
+
+test_preds_prob  <- predict(model, newdata = testData, type = "prob")
+test_preds_class <- predict(model, newdata = testData)
+
+test_results <- caret::confusionMatrix(
+  data      = test_preds_class,
+  reference = testData$occ,
+  positive  = "Pres"
+)
+
+final_metrics <- data.frame(
+  Species     = "ERS_n",
+  Accuracy    = test_results$overall["Accuracy"],
+  Kappa       = test_results$overall["Kappa"],
+  Sensitivity = test_results$byClass["Sensitivity"],
+  Specificity = test_results$byClass["Specificity"],
+  F1          = test_results$byClass["F1"],
+  AUC         = MLmetrics::AUC(
+    test_preds_prob$Pres,
+    ifelse(testData$occ == "Pres", 1, 0)
+  )
+)
+
+print(final_metrics)
+write.csv(final_metrics, "results/Final_Test_Metricsfinal13feb26.csv", row.names = FALSE)
+
+# ROC Curve and AUC Calculation for Independent Test Set
+
+roc_curve <- roc(
+  response  = testData$occ,
+  predictor = test_preds_prob$Pres,
+  levels    = c("Abs", "Pres")
+)
+
+cat("\nAUC on independent test set:", round(auc(roc_curve), 4), "\n")
+plot(roc_curve, main = "ROC Curve - Independent Test Set", print.auc = TRUE)
+
+png("./results/independent_test_roc_curve_finalmodel.png", width = 6, height = 6, units = "in", res = 300)
+plot(roc_curve,
+     main      = "ROC Curve - Independent Test Set",
+     print.auc = TRUE,
+     col       = "#0072B2",
+     lwd       = 2)
+dev.off()
+
+# Determine Optimal Threshold using TSS and Evaluate Metrics at that Threshold
+
+obs <- factor(testData$occ, levels = c("Abs", "Pres"))
+p   <- as.numeric(test_preds_prob[, "Pres"])
+
+roc_obj <- pROC::roc(
+  response  = obs,
+  predictor = p,
+  levels    = c("Abs", "Pres"),
+  direction = "<"
+)
+
+best <- pROC::coords(
+  roc_obj,
+  x           = "best",
+  best.method = "youden",
+  ret         = c("threshold", "sensitivity", "specificity"),
+  transpose   = FALSE
+)
+
+thr_tss <- as.numeric(best[["threshold"]])
+sens    <- as.numeric(best[["sensitivity"]])
+spec    <- as.numeric(best[["specificity"]])
+tss     <- sens + spec - 1
+
+cat(
+  "TSS-optimal threshold =", round(thr_tss, 4),
+  "| Sens =", round(sens, 3),
+  "| Spec =", round(spec, 3),
+  "| TSS =", round(tss, 3), "\n"
+)
+
+pred_tss <- factor(ifelse(p >= thr_tss, "Pres", "Abs"), levels = c("Abs", "Pres"))
+cm_tss   <- caret::confusionMatrix(pred_tss, obs, positive = "Pres")
+print(cm_tss)
+
+# Compile final metrics at TSS-optimal threshold
+
+test_preds_class_tss <- ifelse(test_preds_prob$Pres >= thr_tss, "Pres", "Abs") |>
+  factor(levels = c("Abs", "Pres"))
+
+cm_tss <- caret::confusionMatrix(
+  data      = test_preds_class_tss,
+  reference = testData$occ,
+  positive  = "Pres"
+)
+
+sens <- as.numeric(cm_tss$byClass["Sensitivity"])
+spec <- as.numeric(cm_tss$byClass["Specificity"])
+tss  <- sens + spec - 1
+
+final_metrics <- data.frame(
+  Species     = "ERS_n",
+  Threshold   = thr_tss,
+  Accuracy    = cm_tss$overall["Accuracy"],
+  Kappa       = cm_tss$overall["Kappa"],
+  Sensitivity = sens,
+  Specificity = spec,
+  F1          = cm_tss$byClass["F1"],
+  TSS         = tss,
+  AUC         = MLmetrics::AUC(
+    test_preds_prob$Pres,
+    ifelse(testData$occ == "Pres", 1, 0)
+  )
+)
+
+print(final_metrics)
+write.csv(final_metrics, "results/Final_Test_Metrics_with_TSS_threshold_13feb26.csv", row.names = FALSE)
+```
+
+# Spatial Autocorrelation Analysis
+
+In this section, we will analyze the spatial autocorrelation of both the presence/absence data and the residuals from our final Random Forest model. It is a matter of transparency and good practice to assess whether there is significant spatial structure in the data that could influence model performance and interpretation. We will use semivariograms to visualize spatial dependence and Moran's I statistic to quantify it.
+
+## Semi-variogram and Moran's I
+
+```{r morinsI, cache=TRUE, message=FALSE, warning=FALSE}
+library(spdep)
+library(furrr)
+library(dplyr)
+library(tibble)
+
+plan(multisession, workers = 24)
+```
+
+### Sugar Maple Spatial Dependence Analysis
+
+```{r semi_sp, cache=TRUE, message=FALSE, warning=FALSE}
+library(sf)
+library(spdep)
+library(dplyr)
+library(gstat)
+
+
+df_sp <- plots_sf %>%
+  mutate(
+    longitude = st_coordinates(geometry)[, 1],
+    latitude  = st_coordinates(geometry)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  drop_na()
+
+df_sp$Presence <- as.integer(as.character(df_sp$Presence))
+probs_sp       <- predict(model, type = "prob", newdata = df_sp)[, 2]
+df_sp$resid    <- probs_sp - df_sp$Presence
+
+sf_res_sp <- st_as_sf(df_sp, coords = c("longitude", "latitude"), crs = 2950)
+sp_res_sp <- as(sf_res_sp, "Spatial")
+
+vgm_exp_sp  <- variogram(resid ~ 1, data = sp_res_sp)
+plot_svar_sp <- plot(vgm_exp_sp, main = "Experimental semivariogram - Sample_sp")
+
+model_init_sp <- vgm(psill = 0.42, "Sph", range = 10000, nugget = 0.38)
+vgm_fit_sp    <- fit.variogram(vgm_exp_sp, model = model_init_sp)
+plot_svar_sp_fit <- plot(vgm_exp_sp, model = vgm_fit_sp, main = "Fitted semivariogram - Sample_sp")
+
+print(vgm_fit_sp)
+
+coords_sp <- df_sp[, c("longitude", "latitude")]
+nb_sp     <- dnearneigh(as.matrix(coords_sp), d1 = 0, d2 = 8993)
+if (any(card(nb_sp) == 0)) nb_sp <- knn2nb(knearneigh(as.matrix(coords_sp), k = 4))
+lw_sp <- nb2listw(nb_sp, style = "W")
+
+df_sp$Presence_num   <- as.integer(as.character(df_sp$Presence))
+moran_presence_sp    <- moran.test(df_sp$Presence_num, lw_sp)
+moran_resid_sp       <- moran.test(df_sp$resid, lw_sp)
+
+moran_presence_sp; moran_resid_sp
+
+saveRDS(list(
+  vgm_exp        = vgm_exp_sp,
+  vgm_fit        = vgm_fit_sp,
+  moran_presence = moran_presence_sp,
+  moran_resid    = moran_resid_sp
+), "results/spatial_dependence_sample_sp.rds")
+
+dist_matrix        <- dist(plots_sf %>% st_coordinates())
+dist_matrix        <- as.matrix(dist_matrix)
+neighbor_distances <- apply(dist_matrix, 1, function(x) sort(x)[2:21])
+mean_distance      <- mean(neighbor_distances)
+sd_dist            <- sd(neighbor_distances)
+cat("Mean distance to 20 nearest neighbors:", round(mean_distance, 2), "units\n")
+cat("Standard deviation of distances:", round(sd_dist, 2), "units\n")
+```
+
+## LISA Analysis
+
+This approach will allow us to identify how spatial dependency is distributed for both the presence/absence raw data and the model residuals.
+If we could select the location of our plots, we could have a more regular sampling design and avoid some of the issues with spatial autocorrelation. However, since we are working with existing plot locations, we need to account for the spatial structure in our analysis and modeling.
+
+```{r LISA, cache=TRUE, message=FALSE, warning=FALSE}
+library(sf)
+library(spdep)
+library(dplyr)
+library(ggplot2)
+
+df_sf_sp <- st_as_sf(df_sp, coords = c("longitude", "latitude"), crs = 2950)
+
+lisa_presence_sp  <- localmoran(df_sf_sp$Presence_num, lw_sp, alternative = "two.sided")
+lisa_residuals_sp <- localmoran(df_sf_sp$resid, lw_sp, alternative = "two.sided")
+
+df_sf_sp <- df_sf_sp %>%
+  mutate(
+    presence_lisa_i_sp  = lisa_presence_sp[, "Ii"],
+    presence_p_value_sp = lisa_presence_sp[, "Pr(z != E(Ii))"],
+    presence_z_score_sp = lisa_presence_sp[, "Z.Ii"],
+    presence_cluster_sp = case_when(
+      presence_p_value_sp < 0.05 & Presence_num == 1 & presence_z_score_sp > 0 ~ "High-High",
+      presence_p_value_sp < 0.05 & Presence_num == 0 & presence_z_score_sp > 0 ~ "Low-Low",
+      presence_p_value_sp < 0.05 & Presence_num == 1 & presence_z_score_sp < 0 ~ "High-Low",
+      presence_p_value_sp < 0.05 & Presence_num == 0 & presence_z_score_sp < 0 ~ "Low-High",
+      TRUE ~ "Not Significant"
+    ),
+    resid_lisa_i_sp  = lisa_residuals_sp[, "Ii"],
+    resid_p_value_sp = lisa_residuals_sp[, "Pr(z != E(Ii))"],
+    resid_z_score_sp = lisa_residuals_sp[, "Z.Ii"],
+    resid_cluster_sp = case_when(
+      resid_p_value_sp < 0.05 & resid > 0 & resid_z_score_sp > 0 ~ "High-High",
+      resid_p_value_sp < 0.05 & resid < 0 & resid_z_score_sp > 0 ~ "Low-Low",
+      resid_p_value_sp < 0.05 & resid > 0 & resid_z_score_sp < 0 ~ "High-Low",
+      resid_p_value_sp < 0.05 & resid < 0 & resid_z_score_sp < 0 ~ "Low-High",
+      TRUE ~ "Not Significant"
+    )
+  )
+
+cluster_colors <- c(
+  "High-High"       = "red",
+  "Low-Low"         = "blue",
+  "High-Low"        = "orange",
+  "Low-High"        = "darkblue",
+  "Not Significant" = "grey80"
+)
+
+plot_presence_sp <- ggplot() +
+  geom_sf(data = df_sf_sp, aes(color = presence_cluster_sp), size = 1, show.legend = "point") +
+  scale_color_manual(values = cluster_colors, name = "Cluster Type") +
+  labs(
+    title    = "LISA Clusters for Presence (sugar maple)",
+    subtitle = "Significant spatial autocorrelation patterns (p < 0.05)"
+  ) +
+  theme_minimal()
+
+plot_residuals_sp <- ggplot() +
+  geom_sf(data = df_sf_sp, aes(color = resid_cluster_sp), size = 1, show.legend = "point") +
+  scale_color_manual(values = cluster_colors, name = "Cluster Type") +
+  labs(
+    title    = "LISA Clusters for Model Residuals (sugar maple)",
+    subtitle = "Significant spatial autocorrelation patterns (p < 0.05)"
+  ) +
+  theme_minimal()
+
+library(ggpubr)
+dev.new(); print(plot_presence_sp)
+dev.new(); print(plot_residuals_sp)
+
+combined_lisa_plots_sp <- ggarrange(
+  plot_presence_sp, plot_residuals_sp,
+  ncol          = 2,
+  nrow          = 1,
+  labels        = c("A. Presence", "B. Model Residuals"),
+  common.legend = TRUE,
+  legend        = "right"
+)
+
+ggsave("results/lisa_clusters_spm_combined.svg", combined_lisa_plots_sp,
+       width = 14, height = 7, dpi = 300)
+
+cat("Cluster counts for Presence:\n")
+table(df_sf_sp$presence_cluster_sp)
+cat("\nCluster counts for Model Residuals:\n")
+table(df_sf_sp$resid_cluster_sp)
+
+st_write(df_sf_sp, "lisa_results_SM.gpkg", delete_layer = TRUE)
+
+df_to_save <- df_sf_sp %>% dplyr::select(-any_of("geom"))
+sf::st_write(df_to_save, "results/lisa_results__sp.gpkg", delete_dsn = TRUE)
+write_csv(st_drop_geometry(df_sf_sp), "results/lisa_results_sp.csv")
+saveRDS(model, file = "results/rf_model_sp.rds")
+```
+
+## Consolidate Spatial Tests
+
+```{r cons_all, echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+library(tibble)
+library(dplyr)
+library(glue)
+
+DISTANCES <- c("sp")
+
+moran_all <- list()
+for (dist in DISTANCES) {
+  presence_obj_name <- glue("moran_presence{dist}")
+  resid_obj_name    <- glue("moran_resid{dist}")
+  if (exists(presence_obj_name)) moran_all[[glue("S{dist}_Presence")]]  <- get(presence_obj_name)
+  if (exists(resid_obj_name))    moran_all[[glue("S{dist}_Residuals")]] <- get(resid_obj_name)
+}
+
+moran_table <- tibble(
+  Sample      = names(moran_all),
+  Type        = ifelse(grepl("Presence", names(moran_all)), "Presence", "Residuals"),
+  Distance    = gsub("S|_Presence|_Residuals", "", names(moran_all)),
+  Moran_I     = sapply(moran_all, function(x) x$estimate[["Moran I statistic"]]),
+  Expectation = sapply(moran_all, function(x) x$estimate[["Expectation"]]),
+  Variance    = sapply(moran_all, function(x) x$estimate[["Variance"]]),
+  Z_score     = sapply(moran_all, function(x) x$statistic),
+  p_value     = sapply(moran_all, function(x) x$p.value)
+)
+
+print(moran_table)
+write.csv(moran_table, "./results/moran_summary_table_jun24_25.csv", row.names = FALSE)
+
+veg_all   <- list()
+veg_plots <- list()
+for (dist in DISTANCES) {
+  vgm_obj_name  <- glue("vgm_fit{dist}")
+  plot_obj_name <- glue("plot_svar_{dist}_fit")
+  if (exists(vgm_obj_name))  veg_all[[glue("S{dist}")]]   <- get(vgm_obj_name)
+  if (exists(plot_obj_name)) veg_plots[[glue("S{dist}")]] <- get(plot_obj_name)
+}
+
+veg_summary <- tibble(
+  Sample = names(veg_all),
+  Model  = sapply(veg_all, function(x) as.character(x$model[2])),
+  Psill  = sapply(veg_all, function(x) x$psill[2]),
+  Nugget = sapply(veg_all, function(x) x$psill[1]),
+  Range  = sapply(veg_all, function(x) x$range[2])
+)
+
+print(veg_summary)
+write.csv(veg_summary, "./results/veg_models_summary.csv", row.names = FALSE)
+saveRDS(veg_all,   "./results/fitted_vgm_list.rds")
+saveRDS(veg_plots, "./results/veg_plots_list.rds")
+
+lisa_summary_list   <- list()
+lisa_full_data_list <- list()
+
+for (dist in DISTANCES) {
+  lisa_df_name <- glue("df_sf_{dist}")
+  if (exists(lisa_df_name)) {
+    current_df <- get(lisa_df_name)
+    lisa_full_data_list[[glue("S{dist}")]] <- current_df
+
+    presence_col <- glue("presence_cluster_{dist}")
+    resid_col    <- glue("resid_cluster_{dist}")
+
+    presence_counts <- if (presence_col %in% names(current_df)) {
+      as.data.frame(table(current_df[[presence_col]])) %>%
+        setNames(c("Cluster_Type", "Count")) %>%
+        mutate(Variable = "Presence")
+    } else {
+      data.frame()
+    }
+
+    resid_counts <- if (resid_col %in% names(current_df)) {
+      as.data.frame(table(current_df[[resid_col]])) %>%
+        setNames(c("Cluster_Type", "Count")) %>%
+        mutate(Variable = "Residuals")
+    } else {
+      data.frame()
+    }
+
+    lisa_summary_list[[as.character(dist)]] <- bind_rows(presence_counts, resid_counts) %>%
+      mutate(Distance = as.character(dist))
+  }
+}
+
+if (length(lisa_summary_list) > 0) {
+  lisa_summary_table <- bind_rows(lisa_summary_list) %>%
+    dplyr::select(Distance, Variable, Cluster_Type, Count)
+  print(lisa_summary_table)
+  write.csv(lisa_summary_table, "./results/lisa_cluster_summary.csv", row.names = FALSE)
+  saveRDS(lisa_full_data_list, "./results/lisa_processed_data_list.rds")
+} else {
+  cat("No LISA result data frames found to summarize.\n")
+}
+```
+
+## randomForestExplainer
+
+Here we will use the `randomForestExplainer` package to analyze the variable importance and interactions in our final Random Forest model. This will help us understand which predictors are most influential in determining the presence of sugar maple and how they interact with each other.
+
+```{r RFexplain, message=FALSE, warning=FALSE, cache=TRUE}
+devtools::install_github("ModelOriented/randomForestExplainer")
+library(randomForestExplainer)
+
+importancia <- randomForestExplainer::measure_importance(model$finalModel)
+randomForestExplainer::explain_forest(model$finalModel, path = "results/rfexplainer")
+```
+
+## ALE Plots — Feature Effects
+
+ALE Plots are a powerful tool for interpreting complex machine learning models, providing insights into how each predictor variable influences the model's predictions while accounting for interactions with other variables. The advantages of ALE plots compared to traditional Partial Dependence Plots (PDPs) include their ability to handle correlated predictors and provide more accurate representations of feature effects, especially in the presence of interactions.
+In this section, we will generate ALE plots for our final Random Forest model to visualize the effects of the most important predictors on the probability of sugar maple presence.
+
+```{r predictor, message=FALSE, warning=FALSE}
+library(randomForest)
+library(iml)
+library(tidyverse)
+
+variaveis    <- selected_vars
+trainData_ale <- model$trainingData %>%
+  as.data.frame() %>%
+  dplyr::select(all_of(variaveis))
+
+imp    <- caret::varImp(model, scale = TRUE)
+imp_df <- as.data.frame(imp$importance)
+imp_df$Variable <- rownames(imp_df)
+imp_df <- imp_df[order(-imp_df$Pres), ]
+
+write.csv(imp_df, "./results/variable_importance_for_ALEcaret.csv", row.names = FALSE)
+importance(model$finalModel) %>% as.data.frame() %>%
+  write.csv("./results/variable_importance_for_ALE.csv")
+
+trainData_ale$Presence  <- model$trainingData$.outcome
+trainData_ale$PresenceP <- predict(model, newdata = trainData_ale, type = "prob")[, 2]
+predictor <- Predictor$new(model, data = trainData_ale, y = as.factor(trainData_ale$Presence))
+```
+
+```{r eff_imp, message=FALSE, warning=FALSE}
+ale <- FeatureEffect$new(predictor, feature = "MCMT", grid.size = 20, method = "ale", center.at = 0)
+ale$plot()
+```
+
+### ALE Plots — Functional Approach
+
+```{r ALE_functionalAppr, message=FALSE, warning=FALSE}
+library(iml)
+library(dplyr)
+library(ggplot2)
+library(ggExtra)
+library(gridExtra)
+
+features_to_analyze <- selected_vars
+
+options(future.globals.maxSize = 2 * 1024^3)
+effs <- FeatureEffects$new(
+  predictor,
+  features  = features_to_analyze,
+  method    = "ale",
+  grid.size = 15
+)
+
+res <- dplyr::bind_rows(effs$results) %>%
+  dplyr::filter(.class == "Pres")
+
+theme_pub <- function(base_size = 10) {
+  ggplot2::theme_minimal(base_size = base_size) +
+    ggplot2::theme(
+      panel.grid.minor   = ggplot2::element_blank(),
+      panel.grid.major.x = ggplot2::element_blank(),
+      axis.title         = ggplot2::element_text(face = "bold"),
+      plot.title         = ggplot2::element_text(face = "bold", size = base_size + 1),
+      plot.subtitle      = ggplot2::element_text(size = base_size - 1),
+      strip.text         = ggplot2::element_text(face = "bold"),
+      plot.margin        = ggplot2::margin(5, 5, 5, 5)
+    )
+}
+
+get_xvec <- function(train_data, feature_name) {
+  x <- train_data[[feature_name]]
+  if (inherits(x, "factor"))  x <- as.numeric(as.character(x))
+  if (inherits(x, "integer")) x <- as.numeric(x)
+  if (!is.numeric(x))         x <- suppressWarnings(as.numeric(x))
+  x
+}
+
+plot_ale_continuous <- function(feature_name, ale_data, train_data, x_lab = NULL) {
+  if (is.null(x_lab)) x_lab <- feature_name
+
+  plot_data <- ale_data %>%
+    dplyr::filter(.feature == feature_name) %>%
+    dplyr::mutate(x = .data[[".borders"]]) %>%
+    dplyr::filter(is.finite(x), is.finite(.value))
+
+  xvec  <- get_xvec(train_data, feature_name)
+  xvec  <- xvec[is.finite(xvec)]
+  med_x <- stats::median(xvec, na.rm = TRUE)
+
+  p <- ggplot(plot_data, aes(x = x, y = .value)) +
+    geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4) +
+    geom_vline(xintercept = med_x, linetype = "dotted", linewidth = 0.5) +
+    geom_line(linewidth = 0.7) +
+    geom_point(size = 0.9, alpha = 0.8) +
+    labs(x = x_lab, y = "ALE", title = feature_name) +
+    theme_pub()
+
+  ggExtra::ggMarginal(p, margins = "x", type = "boxplot", x = xvec, size = 3, fill = "grey85")
+}
+
+plot_ale_categorical <- function(feature_name, ale_data, train_data, x_lab = NULL) {
+  if (is.null(x_lab)) x_lab <- feature_name
+
+  td <- train_data
+  td[[feature_name]] <- droplevels(as.factor(td[[feature_name]]))
+
+  data_count <- td %>%
+    group_by(.data[[feature_name]]) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    rename(.borders = 1)
+
+  data_for_plot <- ale_data %>%
+    filter(.feature == feature_name) %>%
+    left_join(data_count, by = ".borders") %>%
+    mutate(
+      count   = ifelse(is.na(count), 0, count),
+      alpha_w = scales::rescale(log(count + 1), to = c(0.35, 1))
+    )
+
+  ggplot(data_for_plot, aes(x = .borders, y = .value)) +
+    geom_hline(yintercept = 0, linewidth = 0.4) +
+    geom_col(aes(alpha = alpha_w)) +
+    scale_alpha_identity() +
+    labs(x = x_lab, y = "ALE", title = feature_name) +
+    theme_pub() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+
+available_features  <- intersect(features_to_analyze, names(trainData))
+categorical_features <- intersect(c("Curv_class", "AspectClass"), available_features)
+continuous_features  <- setdiff(available_features, categorical_features)
+
+all_plots <- list()
+for (feature in continuous_features)  all_plots[[feature]] <- plot_ale_continuous(feature, res, trainData)
+for (feature in categorical_features) all_plots[[feature]] <- plot_ale_categorical(feature, res, trainData)
+
+if (length(all_plots) > 0) {
+  ordered_plots  <- all_plots[intersect(features_to_analyze, names(all_plots))]
+  final_plot_grid <- gridExtra::grid.arrange(grobs = ordered_plots, ncol = 4)
+
+  ggsave("./results/ale_plot_grid.png", final_plot_grid, width = 14, height = 10, dpi = 300, bg = "white")
+  ggsave("./results/ale_plot_grid.svg", final_plot_grid, width = 14, height = 10, dpi = 300, bg = "white")
+} else {
+  cat("No plots generated. Check feature names.\n")
+}
+```
+
+# Climate Scenarios — SSP3-7.0 Supplementary Predictions
+
+This step involves preparing the environmental data for both the contemporary climate scenario and the future climate scenarios under SSP3-7.0 for the years 2021-2040 and 2041-2060. We will read in the relevant climate data, combine it with our soil and topographic variables, and prepare it for making predictions with our Random Forest model. This will allow us to analyze potential habitat shifts for sugar maple under future climate conditions.
+
+```{r climate_scenarios_part2, cache=TRUE, message=FALSE, warning=FALSE}
+library(dplyr)
+library(data.table)
+
+sols   <- readRDS("./database/Sols/sols.rds")
+topo_df <- readRDS("./database/topo_vars1/topo_vars.rds")
+
+sols_topo <- sols %>%
+  cbind(topo_df) %>%
+  dplyr::rename(Clay = CLAY)
+
+rm(sols, topo_df); gc()
+
+file_contemporary   <- "database/UPE_1415NC/Climate/UPE_1415NC_Normal_1991_2020Y.csv"
+file_future_2021_40 <- "database/UPE_1415NC/Climate/UPE_1415NC_4 GCMsY.csv"
+file_future_2041_60 <- "database/UPE_1415NC/Climate/UPE_1415NC_4 GCMsY_.csv"
+
+base_cols               <- c("x", "y")
+climate_vars_base_names <- c("MCMT", "MAP", "TD", "RH", "id1")
+
+contemporary_data <- fread(
+  file_contemporary,
+  select     = c(base_cols, climate_vars_base_names, "Longitude", "Latitude"),
+  na.strings = c("NA", "-9999", "")
+)
+contemporary_data[, Year := "Normal_1991_2020"]
+
+filter_2021_40 <- "8GCMs_ensemble_ssp370_2021-2040.gcm"
+future_data_raw_2021_2040 <- fread(
+  file_future_2021_40,
+  select     = c("Year", "Latitude", "Longitude", climate_vars_base_names),
+  na.strings = c("NA", "-9999", "")
+)[Year == filter_2021_40]
+
+filter_2041_60 <- "8GCMs_ensemble_ssp370_2041-2060.gcm"
+future_data_raw_2041_2060 <- fread(
+  file_future_2041_60,
+  select     = c("Year", "Latitude", "Longitude", climate_vars_base_names),
+  na.strings = c("NA", "-9999", "")
+)[Year == filter_2041_60]
+
+base_env_clim_Normal <- cbind(sols_topo, contemporary_data) %>%
+  na.omit() %>%
+  dplyr::mutate(Clay = CLAY)
+
+base_env_clim_Normal$Presence <- terra::extract(
+  presence, base_env_clim_Normal[, c("x", "y")], method = "simple"
+)[, 2]
+
+base_env_clim_ssp370_21 <- cbind(sols_topo[1:35347280, ], future_data_raw_2021_2040) %>%
+  na.omit() %>%
+  dplyr::mutate(Clay = CLAY)
+
+base_env_clim_ssp370_41 <- cbind(sols_topo[1:35347280, ], future_data_raw_2041_2060) %>%
+  na.omit() %>%
+  dplyr::mutate(Clay = CLAY)
+```
+
+# RF Predictions and Habitat Shift Analysis
+
+This is the final step where we will use our trained Random Forest model to make predictions on the contemporary and future climate scenarios. We will apply a threshold to convert predicted probabilities into binary presence/absence classifications, and then create raster layers to visualize the spatial distribution of suitable habitat for sugar maple under current and future conditions. This will allow us to analyze potential habitat shifts and identify areas that may become more or less suitable for sugar maple in the future.
+
+## Predictions
+
+```{r RF_pred, cache=TRUE}
+library(dplyr)
+library(ggplot2)
+
+thr       <- 0.5675
+pos_class <- "Pres"
+
+predict_with_threshold <- function(model, newdata, thr, pos_class = "Pres") {
+  p   <- predict(model, newdata = newdata, type = "prob")[, pos_class]
+  cls <- factor(ifelse(p >= thr, pos_class, "Abs"), levels = c(pos_class, "Abs"))
+  list(prob = p, class = cls)
+}
+
+pred_norm <- predict_with_threshold(model, base_env_clim_Normal, thr, pos_class)
+base_env_clim_Normal$pred_prob_norm        <- pred_norm$prob
+base_env_clim_Normal$pred_classes_norm_thr <- pred_norm$class
+
+pred_21 <- predict_with_threshold(model, base_env_clim_ssp370_21, thr, pos_class)
+base_env_clim_ssp370_21$pred_prob_ssp370_21        <- pred_21$prob
+base_env_clim_ssp370_21$pred_classes_ssp370_21_thr <- pred_21$class
+
+base_env_clim_Normal$pred_classes_ssp370_21 <-
+  base_env_clim_ssp370_21$pred_classes_ssp370_21_thr[1:nrow(base_env_clim_Normal)]
+
+rm(pred_norm, pred_21); gc()
+
+base_env_clim_Normal$pred_classes_norm <- predict(model, newdata = base_env_clim_Normal, type = "raw")
+base_env_clim_Normal$pred_classes_ssp370_21 <- predict(model, newdata = base_env_clim_ssp370_21, type = "raw")
+base_env_clim_Normal$pred_classes_ssp370_41 <- predict(model, newdata = base_env_clim_ssp370_41, type = "raw")
+
+base_env_clim_Normal$Presence <- terra::extract(
+  presence, base_env_clim_Normal[, c("x", "y")], method = "simple"
+)[, 2]
+
+head(base_env_clim_Normal)
+table(base_env_clim_Normal$pred_classes_norm)
+table(base_env_clim_Normal$pred_classes_ssp370_21)
+table(base_env_clim_Normal$pred_classes_ssp370_41)
+```
+
+# Spatial Habitat Shift Analysis
+
+## Create Rasters
+
+```{r RASTERS}
+library(terra)
+library(dplyr)
+library(tibble)
+
+data_for_rasters <- base_env_clim_Normal %>%
+  dplyr::select(x, y, Presence, pred_classes_norm_thr, pred_classes_ssp370_21) %>%
+  mutate(
+    pred_classes_norm_num    = ifelse(pred_classes_norm_thr == "Pres", 1, 0),
+    pred_classes_ssp370_num  = ifelse(pred_classes_ssp370_21 == "Pres", 1, 0),
+    pred_classes_ssp370_num1 = ifelse(base_env_clim_Normal$pred_classes_ssp370_41 == "Pres", 1, 0)
+  )
+
+create_raster_from_df <- function(df, value_col) {
+  rast(df[, c("x", "y", value_col)], type = "xyz", crs = "EPSG:2950")
+}
+
+observed_suitability          <- create_raster_from_df(data_for_rasters, "Presence")
+predicted_current_suitability <- create_raster_from_df(data_for_rasters, "pred_classes_norm_num")
+predicted_future_suitability  <- create_raster_from_df(data_for_rasters, "pred_classes_ssp370_num")
+predicted_future_suitability1 <- create_raster_from_df(data_for_rasters, "pred_classes_ssp370_num1")
+
+if (!dir.exists("./results")) dir.create("./results")
+
+suitability_colors <- c("beige", "#2ca02c")
+suitability_coltab <- data.frame(value = 0:1, t(col2rgb(suitability_colors)))
+
+for (r_obj in list(
+  list(r = observed_suitability,          path = "./results/observed_suitability_pet.tif"),
+  list(r = predicted_current_suitability, path = "./results/predicted_current_suitability_pet.tif"),
+  list(r = predicted_future_suitability,  path = "./results/predicted_future_suitability_pet.tif"),
+  list(r = predicted_future_suitability1, path = "./results/predicted_future_suitability1_pet.tif")
+)) {
+  coltab(r_obj$r) <- suitability_coltab
+  writeRaster(r_obj$r, r_obj$path, datatype = "INT1U", overwrite = TRUE)
+}
+
+observed_suitability          <- rast("./results/observed_suitability_pet.tif")          %>% mask(pol)
+predicted_current_suitability <- rast("./results/predicted_current_suitability_pet.tif") %>% mask(pol)
+predicted_future_suitability  <- rast("./results/predicted_future_suitability_pet.tif")  %>% mask(pol)
+predicted_future_suitability1 <- rast("./results/predicted_future_suitability1_pet.tif") %>% mask(pol)
+
+plot(observed_suitability,          main = "Observed Suitability")
+plot(predicted_current_suitability, main = "Predicted Current Suitability")
+plot(predicted_future_suitability,  main = "Predicted Future Suitability SSP370 2021-2040")
+plot(predicted_future_suitability1, main = "Predicted Future Suitability SSP370 2041-2060")
+```
+
+## Habitat Shift Analysis
+
+Our approach involves a 2way and 3way classification of habitat suitability changes, allowing us to identify areas of stable suitability, gain, and loss under future climate scenarios. The 2way analysis compares the predicted current suitability with the predicted future suitability, while the 3way analysis incorporates the observed suitability to provide a more comprehensive understanding of habitat shifts. This is the standard method for analyzing habitat shifts in species distribution modeling, as it allows us to categorize changes in habitat suitability in a way that is easy to interpret and visualize.
+We will create raster layers to visualize these changes and generate summary tables to quantify the extent of habitat gain, loss, and stability.
+
+```{r Change_Analysis, cache=TRUE}
+# --- 2-Way Analysis: Predicted Current vs. Predicted Future (2021-2040) ---
+
+combination_raster_2way <- predicted_current_suitability * 10 + predicted_future_suitability
+reclass_matrix_2way     <- matrix(c(0, 1, 1, 2, 10, 3, 11, 4), ncol = 2, byrow = TRUE)
+change_map_2way         <- classify(combination_raster_2way, rcl = reclass_matrix_2way)
+
+levels_2way <- data.frame(
+  ID           = 1:4,
+  Abbreviation = c("Stab_Unsuit", "Gain", "Loss", "Stab_Suit"),
+  Shift_Habitat = c("Stable Unsuitable", "Gain", "Loss", "Stable Suitable"),
+  ClassName    = c("Stable Unsuitable", "Expansion", "Retraction", "Stable Suitable")
+)
+levels(change_map_2way) <- levels_2way[, c("ID", "Abbreviation")]
+
+cell_area_ha      <- (res(change_map_2way)[1] * res(change_map_2way)[2]) / 10000
+summary_table_2way <- as_tibble(freq(change_map_2way)) %>%
+  filter(!is.na(value)) %>%
+  left_join(levels_2way, by = c("value" = "Abbreviation")) %>%
+  mutate(
+    Hectares      = count * cell_area_ha,
+    Percent_Total = (Hectares / sum(Hectares)) * 100
+  ) %>%
+  dplyr::select(Abbreviation = value, Shift_Habitat, ClassName, Hectares, Percent_Total) %>%
+  arrange(factor(Shift_Habitat, levels = c("Loss", "Stable Unsuitable", "Stable Suitable", "Gain")))
+
+print(summary_table_2way, n = 10)
+write.csv(summary_table_2way, "./results/summary_table_2way_change_pet.csv", row.names = FALSE)
+
+colors_2way     <- c("#f5f5dc", "#ffd700", "#ff0000", "#008000")
+color_table_2way <- data.frame(value = levels_2way$ID, t(col2rgb(colors_2way)))
+coltab(change_map_2way) <- color_table_2way
+writeRaster(change_map_2way, "./results/change_map_2way_styled.tif",
+            datatype = "INT1U", overwrite = TRUE)
+
+# --- 2-Way Analysis: Predicted Current vs. Predicted Future (2041-2060) ---
+
+combination_raster_2way1 <- predicted_current_suitability * 10 + predicted_future_suitability1
+change_map_2way1         <- classify(combination_raster_2way1, rcl = reclass_matrix_2way)
+levels(change_map_2way1) <- levels_2way[, c("ID", "Abbreviation")]
+
+summary_table_2way1 <- as_tibble(freq(change_map_2way1)) %>%
+  filter(!is.na(value)) %>%
+  left_join(levels_2way, by = c("value" = "Abbreviation")) %>%
+  mutate(
+    Hectares      = count * cell_area_ha,
+    Percent_Total = (Hectares / sum(Hectares)) * 100
+  ) %>%
+  dplyr::select(Abbreviation = value, Shift_Habitat, ClassName, Hectares, Percent_Total) %>%
+  arrange(factor(Shift_Habitat, levels = c("Loss", "Stable Unsuitable", "Stable Suitable", "Gain")))
+
+print(summary_table_2way1, n = 10)
+write.csv(summary_table_2way1, "./results/summary_table_2way_change1.csv", row.names = FALSE)
+
+coltab(change_map_2way1) <- color_table_2way
+writeRaster(change_map_2way1, "./results/change_map_2way1_styled.tif",
+            datatype = "INT1U", overwrite = TRUE)
+
+# --- 3-Way Analysis: Observed vs. Predicted Current vs. Predicted Future ---
+
+combination_raster_3way <- observed_suitability * 100 + predicted_current_suitability * 10 + predicted_future_suitability
+reclass_matrix_3way     <- matrix(c(0,1, 1,2, 10,3, 11,4, 100,5, 101,6, 110,7, 111,8), ncol = 2, byrow = TRUE)
+change_map_3way         <- classify(combination_raster_3way, rcl = reclass_matrix_3way)
+
+levels_3way <- data.frame(
+  ID           = 1:8,
+  Abbreviation = c(
+    "StableUnsuit_Absent", "Expansion_Absent", "Retraction_Absent", "StableSuit_Absent",
+    "StableUnsuit_Present", "Expansion_Present", "Retraction_Present", "StableSuit_Present"
+  ),
+  Shift_Habitat = c(
+    "Stable Unsuitable", "Gain", "Loss", "Stable Suitable",
+    "Stable Unsuitable", "Gain", "Loss", "Stable Suitable"
+  ),
+  Interpretation = c(
+    "Stable Unsuitable (Correct Model)", "Habitat Expansion (Potential)",
+    "Transient Prediction (Model Error)", "Stable Suitable (Unoccupied)",
+    "Stable Unsuitable (Omission Error)", "Habitat Recolonization (Potential)",
+    "Habitat Retraction (Correct Model)", "Stable Suitable (Core Habitat)"
+  )
+)
+levels(change_map_3way) <- levels_3way[, c("ID", "Abbreviation")]
+
+summary_table_3way <- as_tibble(freq(change_map_3way)) %>%
+  filter(!is.na(value)) %>%
+  left_join(levels_3way, by = c("value" = "Abbreviation")) %>%
+  mutate(
+    Hectares      = count * cell_area_ha,
+    Percent_Total = (Hectares / sum(Hectares)) * 100
+  ) %>%
+  dplyr::select(Abbreviation = value, Shift_Habitat, Interpretation, Hectares, Percent_Total)
+
+print(summary_table_3way, n = 10)
+write.csv(summary_table_3way, "./results/summary_table_3way_change.csv", row.names = FALSE)
+
+colors_3way <- c("#f5f5dc", "#ffd700", "#ff8c00", "#a6cee3",
+                 "#ff9999", "#66cdaa", "#ff0000", "#008000")
+coltab(change_map_3way) <- data.frame(value = levels_3way$ID, t(col2rgb(colors_3way)))
+writeRaster(change_map_3way, "./results/change_map_3way_styled.tif",
+            datatype = "INT1U", overwrite = TRUE)
+
+plot(change_map_2way,  main = "2-Way Change Map (Current vs. Future 2021-2040)")
+plot(change_map_2way1, main = "2-Way Change Map (Current vs. Future 2041-2060)")
+plot(change_map_3way,  main = "3-Way Change Map (Observed vs. Current vs. Future)")
+```
+
+
+# Render the R Markdown document to generate the final report.
+
+```{r render_report, eval=FALSE}
+tmpdir <- "G:/tmp"
+dir.create(tmpdir, showWarnings = FALSE)
+Sys.setenv(TMPDIR = tmpdir, TMP = tmpdir, TEMP = tmpdir)
+rmarkdown::render(
+  input = "analysis_report.Rmd",
+  output_dir = "G:/tmp",
+  knit_root_dir = "G:/Thesis/1stChapter"
+)
+
+```
